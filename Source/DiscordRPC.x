@@ -1,7 +1,7 @@
 #import <MediaPlayer/MediaPlayer.h>
 
 // Your Discord token
-static NSString * const kDiscordToken = @"YOUR_USER_TOKEN_HERE";
+static NSString * const kDiscordToken = @"__DISCORD_TOKEN__";
 
 %hook MPNowPlayingInfoCenter
 
