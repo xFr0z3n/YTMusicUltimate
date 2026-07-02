@@ -1,7 +1,7 @@
 #import <MediaPlayer/MediaPlayer.h>
 
-// EDIT THIS before building — your RPi5's LAN IP or hostname
-static NSString * const kRPiEndpoint = @"http://192.168.1.XXX:5005/nowplaying";
+// Your Discord user token — treat like a password, never commit to a public repo
+static NSString * const kDiscordToken = @"YOUR_USER_TOKEN_HERE";
 
 %hook MPNowPlayingInfoCenter
 
@@ -9,44 +9,47 @@ static NSString * const kRPiEndpoint = @"http://192.168.1.XXX:5005/nowplaying";
     %orig;
 
     if (!info) {
-        // Nothing playing / stopped
-        [self ytmu_postPlaybackState:nil];
+        [self ytmu_clearDiscordStatus];
         return;
     }
 
     NSString *title  = info[MPMediaItemPropertyTitle] ?: @"";
     NSString *artist = info[MPMediaItemPropertyArtist] ?: @"";
-    NSString *album  = info[MPMediaItemPropertyAlbumTitle] ?: @"";
-    NSNumber *duration = info[MPMediaItemPropertyPlaybackDuration] ?: @(0);
-    NSNumber *elapsed  = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] ?: @(0);
-    NSNumber *rate     = info[MPNowPlayingInfoPropertyPlaybackRate] ?: @(0);
+    NSNumber *rate    = info[MPNowPlayingInfoPropertyPlaybackRate] ?: @(0);
 
-    NSDictionary *payload = @{
-        @"title": title,
-        @"artist": artist,
-        @"album": album,
-        @"duration": duration,
-        @"elapsed": elapsed,
-        @"playing": @([rate floatValue] > 0)
-    };
-
-    [self ytmu_postPlaybackState:payload];
+    if ([rate floatValue] > 0) {
+        [self ytmu_updateDiscordStatus:title artist:artist];
+    } else {
+        [self ytmu_clearDiscordStatus];
+    }
 }
 
 %new
-- (void)ytmu_postPlaybackState:(NSDictionary *)payload {
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kRPiEndpoint]];
-    req.HTTPMethod = @"POST";
+- (void)ytmu_updateDiscordStatus:(NSString *)title artist:(NSString *)artist {
+    NSString *text = [NSString stringWithFormat:@"🎵 %@ — %@", title, artist];
+    [self ytmu_sendCustomStatus:text];
+}
+
+%new
+- (void)ytmu_clearDiscordStatus {
+    [self ytmu_sendCustomStatus:nil];
+}
+
+%new
+- (void)ytmu_sendCustomStatus:(NSString *)text {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"https://discord.com/api/v10/users/@me/settings"]];
+    req.HTTPMethod = @"PATCH";
+    [req setValue:kDiscordToken forHTTPHeaderField:@"Authorization"];
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
-    NSData *body = payload
-        ? [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil]
-        : [@"{\"stopped\":true}" dataUsingEncoding:NSUTF8StringEncoding];
-    req.HTTPBody = body;
+    NSDictionary *statusDict = text ? @{ @"text": text } : @{ @"text": @"" };
+    NSDictionary *body = @{ @"custom_status": statusDict };
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            // fire-and-forget; ignore errors so playback is never blocked
+            // fire-and-forget
         }];
     [task resume];
 }
