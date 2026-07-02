@@ -1,7 +1,13 @@
 #import <MediaPlayer/MediaPlayer.h>
 
-// Your Discord token
+// Your Discord user token — replaced by GitHub Actions at build time
 static NSString * const kDiscordToken = @"__DISCORD_TOKEN__";
+
+@interface MPNowPlayingInfoCenter (YTMU)
+- (void)ytmu_updateDiscordStatus:(NSString *)title artist:(NSString *)artist;
+- (void)ytmu_clearDiscordStatus;
+- (void)ytmu_sendCustomStatus:(NSString *)text;
+@end
 
 %hook MPNowPlayingInfoCenter
 
@@ -49,7 +55,7 @@ static NSString * const kDiscordToken = @"__DISCORD_TOKEN__";
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            
+            // fire-and-forget
         }];
     [task resume];
 }
