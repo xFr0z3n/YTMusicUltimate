@@ -1,6 +1,6 @@
 #import <MediaPlayer/MediaPlayer.h>
 
-// Your Discord user token — treat like a password, never commit to a public repo
+// Your Discord token
 static NSString * const kDiscordToken = @"YOUR_USER_TOKEN_HERE";
 
 %hook MPNowPlayingInfoCenter
@@ -49,7 +49,7 @@ static NSString * const kDiscordToken = @"YOUR_USER_TOKEN_HERE";
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            // fire-and-forget
+            
         }];
     [task resume];
 }
