@@ -80,11 +80,21 @@ jobs:
         run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
       - name: Download YouTube Music
         run: wget "${{ inputs.ipa_url }}" --no-verbose -O ytm.ipa
-      - name: Inject Discord token
+      - name: Inject secrets
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_APP_ID: ${{ secrets.DISCORD_APP_ID }}
+          NEXTCLOUD_WEBDAV_URL: ${{ secrets.NEXTCLOUD_WEBDAV_URL }}
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USER }}
+          NEXTCLOUD_PASS: ${{ secrets.NEXTCLOUD_PASS }}
+          NEXTCLOUD_PUBLIC_URL: ${{ secrets.NEXTCLOUD_PUBLIC_URL }}
         run: |
-          sed -i '' "s/__DISCORD_TOKEN__/$DISCORD_TOKEN/g" main/Source/DiscordRPC.x
+          sed -i '' "s|__DISCORD_TOKEN__|$DISCORD_TOKEN|g" main/Source/DiscordRPC.x
+          sed -i '' "s|__DISCORD_APP_ID__|$DISCORD_APP_ID|g" main/Source/DiscordRPC.x
+          sed -i '' "s|__NEXTCLOUD_WEBDAV_URL__|$NEXTCLOUD_WEBDAV_URL|g" main/Source/DiscordRPC.x
+          sed -i '' "s|__NEXTCLOUD_USER__|$NEXTCLOUD_USER|g" main/Source/DiscordRPC.x
+          sed -i '' "s|__NEXTCLOUD_PASS__|$NEXTCLOUD_PASS|g" main/Source/DiscordRPC.x
+          sed -i '' "s|__NEXTCLOUD_PUBLIC_URL__|$NEXTCLOUD_PUBLIC_URL|g" main/Source/DiscordRPC.x
       - name: Build Tweak for Sideloading
         run: |
           cd main
