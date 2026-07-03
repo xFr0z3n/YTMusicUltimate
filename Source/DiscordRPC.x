@@ -9,20 +9,32 @@ static NSString * const kNextcloudUser      = @"__NEXTCLOUD_USER__";
 static NSString * const kNextcloudPass      = @"__NEXTCLOUD_PASS__";
 static NSString * const kNextcloudPublicURL = @"__NEXTCLOUD_PUBLIC_URL__";
 
+// Shared presence state — the single source of truth, mutated only on the main queue
+static NSString *gTrackTitle = nil;
+static NSString *gTrackArtist = nil;
+static NSString *gTrackAlbum = nil;
+static double gTrackDuration = 0;
+static NSTimeInterval gTrackStartEpoch = 0;
+static NSString *gTrackImageKey = nil;
+static BOOL gPresenceActive = NO;
 static NSString *gLastTrackKey = nil;
+static NSInteger gClearToken = 0;
+
+static void YTMUPushPresence(void);
 
 #pragma mark - Gateway client
 
 @interface YTMUDiscordGateway : NSObject <NSURLSessionWebSocketDelegate>
 + (instancetype)shared;
 - (void)connect;
-- (void)updatePresenceWithTitle:(NSString *)title
-                         artist:(NSString *)artist
-                          album:(NSString *)album
-                       imageKey:(NSString *)imageKey
-                    durationSec:(double)durationSec
-                     elapsedSec:(double)elapsedSec;
+- (void)sendActivityTitle:(NSString *)title
+                   artist:(NSString *)artist
+                    album:(NSString *)album
+                 imageKey:(NSString *)imageKey
+              durationSec:(double)durationSec
+               startEpoch:(NSTimeInterval)startEpoch;
 - (void)clearPresence;
+@property (nonatomic, readonly) BOOL identified;
 @end
 
 @implementation YTMUDiscordGateway {
@@ -32,10 +44,9 @@ static NSString *gLastTrackKey = nil;
     NSInteger _sequence;
     BOOL _identified;
     BOOL _connecting;
-    NSString *_pendingTitle, *_pendingArtist, *_pendingAlbum, *_pendingImageKey;
-    double _pendingDuration, _pendingElapsed;
-    BOOL _hasPending;
 }
+
+- (BOOL)identified { return _identified; }
 
 + (instancetype)shared {
     static YTMUDiscordGateway *instance;
@@ -45,8 +56,8 @@ static NSString *gLastTrackKey = nil;
 }
 
 - (void)connect {
-    NSLog(@"[YTMU] gateway connect() called, socket=%@ connecting=%d", _socket, _connecting);
     if (_socket || _connecting) return;
+    NSLog(@"[YTMU] gateway connecting");
     _connecting = YES;
     _identified = NO;
     _sequence = 0;
@@ -55,9 +66,8 @@ static NSString *gLastTrackKey = nil;
     _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
     NSURL *url = [NSURL URLWithString:@"wss://gateway.discord.gg/?v=10&encoding=json"];
     _socket = [_session webSocketTaskWithURL:url];
-    _socket.maximumMessageSize = 16 * 1024 * 1024; // 16 MB — READY payload blows past the 1 MB default
+    _socket.maximumMessageSize = 16 * 1024 * 1024; // READY blows past the 1 MB default
     [_socket resume];
-    NSLog(@"[YTMU] gateway socket resumed, beginning receive loop");
     [self receiveLoop];
 }
 
@@ -89,7 +99,7 @@ static NSString *gLastTrackKey = nil;
 
     switch (op) {
         case 10: {
-            NSLog(@"[YTMU] gateway: got HELLO, starting heartbeat + identify");
+            NSLog(@"[YTMU] gateway HELLO");
             NSDictionary *d = payload[@"d"];
             NSTimeInterval interval = [d[@"heartbeat_interval"] doubleValue] / 1000.0;
             [self startHeartbeat:interval];
@@ -97,34 +107,27 @@ static NSString *gLastTrackKey = nil;
             break;
         }
         case 0: {
-            NSLog(@"[YTMU] gateway: dispatch event t=%@", payload[@"t"]);
             if ([payload[@"t"] isEqualToString:@"READY"]) {
-                NSLog(@"[YTMU] gateway: READY, identified successfully");
+                NSLog(@"[YTMU] gateway READY");
                 _identified = YES;
                 _connecting = NO;
-                if (_hasPending) {
-                    NSLog(@"[YTMU] gateway: flushing pending presence update");
-                    _hasPending = NO;
-                    [self updatePresenceWithTitle:_pendingTitle artist:_pendingArtist album:_pendingAlbum
-                                          imageKey:_pendingImageKey durationSec:_pendingDuration elapsedSec:_pendingElapsed];
-                }
+                // Re-push whatever is currently playing (handles reconnect after iOS suspend)
+                dispatch_async(dispatch_get_main_queue(), ^{ YTMUPushPresence(); });
             }
             break;
         }
         case 1:
-            // Server asked us to heartbeat immediately
             [self sendHeartbeat];
             break;
-        case 9:
-            NSLog(@"[YTMU] gateway: INVALID SESSION — likely bad token or malformed identify");
+        case 7:
+            NSLog(@"[YTMU] gateway RECONNECT requested");
             [self teardown];
             break;
-        case 7:
-            NSLog(@"[YTMU] gateway: RECONNECT requested by server");
+        case 9:
+            NSLog(@"[YTMU] gateway INVALID SESSION");
             [self teardown];
             break;
         default:
-            NSLog(@"[YTMU] gateway: unhandled opcode %d", op);
             break;
     }
 }
@@ -145,7 +148,6 @@ static NSString *gLastTrackKey = nil;
 }
 
 - (void)identify {
-    NSLog(@"[YTMU] gateway: sending IDENTIFY");
     [self send:@{
         @"op": @(2),
         @"d": @{
@@ -156,26 +158,15 @@ static NSString *gLastTrackKey = nil;
     }];
 }
 
-- (void)updatePresenceWithTitle:(NSString *)title
-                         artist:(NSString *)artist
-                          album:(NSString *)album
-                       imageKey:(NSString *)imageKey
-                    durationSec:(double)durationSec
-                     elapsedSec:(double)elapsedSec {
-    NSLog(@"[YTMU] updatePresence called: title=%@ artist=%@ imageKey=%@ identified=%d", title, artist, imageKey, _identified);
-    if (!_identified) {
-        NSLog(@"[YTMU] not identified yet - queuing presence + connecting");
-        _pendingTitle = title; _pendingArtist = artist; _pendingAlbum = album;
-        _pendingImageKey = imageKey; _pendingDuration = durationSec; _pendingElapsed = elapsedSec;
-        _hasPending = YES;
-        [self connect];
-        return;
-    }
+- (void)sendActivityTitle:(NSString *)title
+                   artist:(NSString *)artist
+                    album:(NSString *)album
+                 imageKey:(NSString *)imageKey
+              durationSec:(double)durationSec
+               startEpoch:(NSTimeInterval)startEpoch {
+    if (!_identified) { [self connect]; return; }
 
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    NSTimeInterval start = now - elapsedSec;
-    NSTimeInterval end = start + durationSec;
-
+    NSTimeInterval end = startEpoch + durationSec;
     NSMutableDictionary *activity = [@{
         @"name": @"YouTube Music",
         @"type": @(2),
@@ -183,13 +174,13 @@ static NSString *gLastTrackKey = nil;
         @"state": artist ?: @"",
         @"application_id": kDiscordAppID,
         @"timestamps": @{
-            @"start": @((long long)(start * 1000)),
+            @"start": @((long long)(startEpoch * 1000)),
             @"end": @((long long)(end * 1000))
         }
     } mutableCopy];
 
     if (imageKey.length > 0) {
-        activity[@"assets"] = @{ @"large_image": imageKey, @"large_text": album ?: @"" };
+        activity[@"assets"] = @{ @"large_image": imageKey, @"large_text": (album.length ? album : (artist ?: @"")) };
     }
 
     [self send:@{
@@ -199,7 +190,6 @@ static NSString *gLastTrackKey = nil;
 }
 
 - (void)clearPresence {
-    NSLog(@"[YTMU] clearPresence called, identified=%d", _identified);
     if (!_identified) return;
     [self send:@{
         @"op": @(3),
@@ -208,7 +198,7 @@ static NSString *gLastTrackKey = nil;
 }
 
 - (void)send:(NSDictionary *)payload {
-    if (!_socket) { NSLog(@"[YTMU] send failed: no socket"); return; }
+    if (!_socket) return;
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithString:str];
@@ -218,7 +208,6 @@ static NSString *gLastTrackKey = nil;
 }
 
 - (void)teardown {
-    NSLog(@"[YTMU] gateway teardown called");
     if (_heartbeatTimer) { dispatch_source_cancel(_heartbeatTimer); _heartbeatTimer = nil; }
     [_socket cancel];
     _socket = nil;
@@ -229,16 +218,26 @@ static NSString *gLastTrackKey = nil;
 
 @end
 
+#pragma mark - Presence push (reads shared state)
+
+static void YTMUPushPresence(void) {
+    if (!gPresenceActive) return;
+    [[YTMUDiscordGateway shared] sendActivityTitle:gTrackTitle
+                                            artist:gTrackArtist
+                                             album:gTrackAlbum
+                                          imageKey:gTrackImageKey
+                                       durationSec:gTrackDuration
+                                        startEpoch:gTrackStartEpoch];
+}
+
 #pragma mark - Artwork upload + external asset registration
 
 static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSString *assetKey));
 
-static void YTMUUploadArtworkAndUpdatePresence(UIImage *artwork, NSString *title, NSString *artist,
-                                                NSString *album, double durationSec, double elapsedSec) {
+static void YTMUResolveArtwork(UIImage *artwork, void (^completion)(NSString *assetKey)) {
     NSData *jpeg = UIImageJPEGRepresentation(artwork, 0.8);
+    if (!jpeg) { completion(nil); return; }
     NSString *cacheBuster = [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]];
-
-    NSLog(@"[YTMU] uploading artwork, %lu bytes", (unsigned long)jpeg.length);
 
     NSMutableURLRequest *putReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kNextcloudWebDAVURL]];
     putReq.HTTPMethod = @"PUT";
@@ -250,27 +249,16 @@ static void YTMUUploadArtworkAndUpdatePresence(UIImage *artwork, NSString *title
     NSURLSessionDataTask *uploadTask = [[NSURLSession sharedSession] dataTaskWithRequest:putReq
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             NSInteger status = [(NSHTTPURLResponse *)response statusCode];
-            NSLog(@"[YTMU] WebDAV PUT status=%ld error=%@", (long)status, error);
-            if (error) return;
+            NSLog(@"[YTMU] WebDAV PUT status=%ld", (long)status);
+            if (error || status >= 400) { completion(nil); return; }
 
             NSString *publicURL = [NSString stringWithFormat:@"%@?t=%@", kNextcloudPublicURL, cacheBuster];
-            NSLog(@"[YTMU] public artwork URL: %@", publicURL);
-
-            YTMURegisterExternalAsset(publicURL, ^(NSString *assetKey) {
-                NSLog(@"[YTMU] final asset key: %@", assetKey);
-                [[YTMUDiscordGateway shared] updatePresenceWithTitle:title
-                                                                artist:artist
-                                                                 album:album
-                                                              imageKey:assetKey
-                                                           durationSec:durationSec
-                                                            elapsedSec:elapsedSec];
-            });
+            YTMURegisterExternalAsset(publicURL, completion);
         }];
     [uploadTask resume];
 }
 
 static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSString *assetKey)) {
-    NSLog(@"[YTMU] Registering external asset for URL: %@", imageURL);
     NSString *endpoint = [NSString stringWithFormat:@"https://discord.com/api/v10/applications/%@/external-assets", kDiscordAppID];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:endpoint]];
     req.HTTPMethod = @"POST";
@@ -281,18 +269,15 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             NSInteger status = [(NSHTTPURLResponse *)response statusCode];
-            NSString *body = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"(no data)";
-            NSLog(@"[YTMU] external-assets response: status=%ld body=%@ error=%@", (long)status, body, error);
-
-            if (error || !data) { completion(nil); return; }
-            NSArray *arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) {
-                NSLog(@"[YTMU] external-assets: unexpected response shape");
+            if (error || !data || status >= 400) {
+                NSLog(@"[YTMU] external-assets failed status=%ld", (long)status);
                 completion(nil);
                 return;
             }
+            NSArray *arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) { completion(nil); return; }
             NSString *path = [arr.firstObject objectForKey:@"external_asset_path"];
-            NSLog(@"[YTMU] resolved asset path: %@", path);
+            NSLog(@"[YTMU] external asset resolved");
             completion(path ? [@"mp:" stringByAppendingString:path] : nil);
         }];
     [task resume];
@@ -302,6 +287,7 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
 
 @interface MPNowPlayingInfoCenter (YTMU)
 - (void)ytmu_handleNowPlayingInfo:(NSDictionary *)info;
+- (void)ytmu_scheduleClear;
 @end
 
 %hook MPNowPlayingInfoCenter
@@ -313,45 +299,94 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
 
 %new
 - (void)ytmu_handleNowPlayingInfo:(NSDictionary *)info {
-    if (!info) {
-        gLastTrackKey = nil;
-        [[YTMUDiscordGateway shared] clearPresence];
+    // Snapshot what we need off the info dict, then serialize all state work on the main queue
+    BOOL playing = NO;
+    NSString *title = @"", *artist = @"", *album = @"";
+    double duration = 0, elapsed = 0;
+    UIImage *artworkImage = nil;
+
+    if (info) {
+        NSNumber *rate = info[MPNowPlayingInfoPropertyPlaybackRate] ?: @(0);
+        playing = [rate floatValue] > 0;
+        title  = info[MPMediaItemPropertyTitle] ?: @"";
+        artist = info[MPMediaItemPropertyArtist] ?: @"";
+        album  = info[MPMediaItemPropertyAlbumTitle] ?: @"";
+        duration = [info[MPMediaItemPropertyPlaybackDuration] doubleValue];
+        elapsed  = [info[MPNowPlayingInfoPropertyElapsedPlaybackTime] doubleValue];
+        MPMediaItemArtwork *artworkObj = info[MPMediaItemPropertyArtwork];
+        artworkImage = artworkObj ? [artworkObj imageWithSize:CGSizeMake(512, 512)] : nil;
+    }
+
+    if (!info || !playing) {
+        [self ytmu_scheduleClear];
         return;
     }
 
-    NSNumber *rate = info[MPNowPlayingInfoPropertyPlaybackRate] ?: @(0);
-    if ([rate floatValue] <= 0) {
-        gLastTrackKey = nil;
-        [[YTMUDiscordGateway shared] clearPresence];
-        return;
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gClearToken++; // cancels any pending debounced clear (this is what kills skip-flicker)
 
-    NSString *title  = info[MPMediaItemPropertyTitle] ?: @"";
-    NSString *artist = info[MPMediaItemPropertyArtist] ?: @"";
-    NSString *album  = info[MPMediaItemPropertyAlbumTitle] ?: @"";
+        NSString *trackKey = [NSString stringWithFormat:@"%@|%@", title, artist];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
-    // Throttle: only act when the track actually changes, not on every position tick
-    NSString *trackKey = [NSString stringWithFormat:@"%@|%@", title, artist];
-    if ([trackKey isEqualToString:gLastTrackKey]) {
-        return;
-    }
-    gLastTrackKey = trackKey;
+        if (![trackKey isEqualToString:gLastTrackKey]) {
+            // NEW TRACK
+            gLastTrackKey = trackKey;
+            gTrackTitle = title;
+            gTrackArtist = artist;
+            gTrackAlbum = album;
+            gTrackDuration = duration;
+            gTrackStartEpoch = now - elapsed;
+            gTrackImageKey = nil;
+            gPresenceActive = YES;
 
-    double duration = [info[MPMediaItemPropertyPlaybackDuration] doubleValue];
-    double elapsed  = [info[MPNowPlayingInfoPropertyElapsedPlaybackTime] doubleValue];
+            NSLog(@"[YTMU] NEW TRACK: %@ — %@", title, artist);
 
-    NSLog(@"[YTMU] NEW TRACK: title=%@ artist=%@ duration=%.1f elapsed=%.1f", title, artist, duration, elapsed);
+            // Snappy: push text + progress instantly, don't wait on artwork
+            YTMUPushPresence();
 
-    MPMediaItemArtwork *artworkObj = info[MPMediaItemPropertyArtwork];
-    UIImage *artworkImage = artworkObj ? [artworkObj imageWithSize:CGSizeMake(512, 512)] : nil;
-    NSLog(@"[YTMU] artwork present: %d", artworkImage != nil);
+            // Resolve artwork in the background, then re-push with the image
+            if (artworkImage) {
+                NSString *keyAtDispatch = trackKey;
+                YTMUResolveArtwork(artworkImage, ^(NSString *assetKey) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        // Only apply if we're still on the same track
+                        if (assetKey && [gLastTrackKey isEqualToString:keyAtDispatch]) {
+                            gTrackImageKey = assetKey;
+                            YTMUPushPresence();
+                        }
+                    });
+                });
+            }
+        } else {
+            // SAME TRACK — detect a scrub/seek (elapsed jumped away from expected)
+            NSTimeInterval expected = now - gTrackStartEpoch;
+            if (fabs(elapsed - expected) > 3.0) {
+                NSLog(@"[YTMU] scrub detected, updating timestamps");
+                gTrackStartEpoch = now - elapsed;
+                YTMUPushPresence(); // keeps existing image, updates progress bar
+            }
+            // else: normal tick, do nothing (no spam)
+        }
+    });
+}
 
-    if (artworkImage) {
-        YTMUUploadArtworkAndUpdatePresence(artworkImage, title, artist, album, duration, elapsed);
-    } else {
-        [[YTMUDiscordGateway shared] updatePresenceWithTitle:title artist:artist album:album
-                                                      imageKey:nil durationSec:duration elapsedSec:elapsed];
-    }
+%new
+- (void)ytmu_scheduleClear {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSInteger myToken = ++gClearToken;
+        // Wait before clearing — a skip briefly reports paused before the next track starts.
+        // If playback resumes within the window, gClearToken advances and this clear is skipped.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (myToken == gClearToken) {
+                NSLog(@"[YTMU] clearing presence (genuinely stopped)");
+                gPresenceActive = NO;
+                gLastTrackKey = nil;
+                gTrackImageKey = nil;
+                [[YTMUDiscordGateway shared] clearPresence];
+            }
+        });
+    });
 }
 
 %end
