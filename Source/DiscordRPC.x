@@ -9,7 +9,7 @@ static NSString * const kNextcloudUser      = @"__NEXTCLOUD_USER__";
 static NSString * const kNextcloudPass      = @"__NEXTCLOUD_PASS__";
 static NSString * const kNextcloudPublicURL = @"__NEXTCLOUD_PUBLIC_URL__";
 
-// Shared presence state — the single source of truth, mutated only on the main queue
+// Shared presence state — mutated only on the main queue
 static NSString *gTrackTitle = nil;
 static NSString *gTrackArtist = nil;
 static NSString *gTrackAlbum = nil;
@@ -66,7 +66,7 @@ static void YTMUPushPresence(void);
     _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
     NSURL *url = [NSURL URLWithString:@"wss://gateway.discord.gg/?v=10&encoding=json"];
     _socket = [_session webSocketTaskWithURL:url];
-    _socket.maximumMessageSize = 16 * 1024 * 1024; // READY blows past the 1 MB default
+    _socket.maximumMessageSize = 16 * 1024 * 1024;
     [_socket resume];
     [self receiveLoop];
 }
@@ -111,7 +111,6 @@ static void YTMUPushPresence(void);
                 NSLog(@"[YTMU] gateway READY");
                 _identified = YES;
                 _connecting = NO;
-                // Re-push whatever is currently playing (handles reconnect after iOS suspend)
                 dispatch_async(dispatch_get_main_queue(), ^{ YTMUPushPresence(); });
             }
             break;
@@ -180,7 +179,13 @@ static void YTMUPushPresence(void);
     } mutableCopy];
 
     if (imageKey.length > 0) {
-        activity[@"assets"] = @{ @"large_image": imageKey, @"large_text": (album.length ? album : (artist ?: @"")) };
+        // large_text shows on hover only. Use album if it differs from artist, else the title —
+        // never repeat the artist (which is already the visible `state` line).
+        NSString *hoverText = title ?: @"";
+        if (album.length && ![album isEqualToString:artist]) {
+            hoverText = album;
+        }
+        activity[@"assets"] = @{ @"large_image": imageKey, @"large_text": hoverText };
     }
 
     [self send:@{
@@ -251,7 +256,6 @@ static void YTMUResolveArtwork(UIImage *artwork, void (^completion)(NSString *as
             NSInteger status = [(NSHTTPURLResponse *)response statusCode];
             NSLog(@"[YTMU] WebDAV PUT status=%ld", (long)status);
             if (error || status >= 400) { completion(nil); return; }
-
             NSString *publicURL = [NSString stringWithFormat:@"%@?t=%@", kNextcloudPublicURL, cacheBuster];
             YTMURegisterExternalAsset(publicURL, completion);
         }];
@@ -283,6 +287,19 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
     [task resume];
 }
 
+// Resolve artwork for a given track key; apply only if that track is still current.
+static void YTMUResolveArtworkForTrack(UIImage *artwork, NSString *trackKey) {
+    if (!artwork) return;
+    YTMUResolveArtwork(artwork, ^(NSString *assetKey) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (assetKey && [gLastTrackKey isEqualToString:trackKey]) {
+                gTrackImageKey = assetKey;
+                YTMUPushPresence(); // re-push now that the image exists (fires even if READY came late)
+            }
+        });
+    });
+}
+
 #pragma mark - Hook
 
 @interface MPNowPlayingInfoCenter (YTMU)
@@ -299,7 +316,6 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
 
 %new
 - (void)ytmu_handleNowPlayingInfo:(NSDictionary *)info {
-    // Snapshot what we need off the info dict, then serialize all state work on the main queue
     BOOL playing = NO;
     NSString *title = @"", *artist = @"", *album = @"";
     double duration = 0, elapsed = 0;
@@ -323,13 +339,12 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        gClearToken++; // cancels any pending debounced clear (this is what kills skip-flicker)
+        gClearToken++; // cancel any pending debounced clear
 
         NSString *trackKey = [NSString stringWithFormat:@"%@|%@", title, artist];
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
         if (![trackKey isEqualToString:gLastTrackKey]) {
-            // NEW TRACK
             gLastTrackKey = trackKey;
             gTrackTitle = title;
             gTrackArtist = artist;
@@ -340,32 +355,19 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
             gPresenceActive = YES;
 
             NSLog(@"[YTMU] NEW TRACK: %@ — %@", title, artist);
-
-            // Snappy: push text + progress instantly, don't wait on artwork
-            YTMUPushPresence();
-
-            // Resolve artwork in the background, then re-push with the image
-            if (artworkImage) {
-                NSString *keyAtDispatch = trackKey;
-                YTMUResolveArtwork(artworkImage, ^(NSString *assetKey) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        // Only apply if we're still on the same track
-                        if (assetKey && [gLastTrackKey isEqualToString:keyAtDispatch]) {
-                            gTrackImageKey = assetKey;
-                            YTMUPushPresence();
-                        }
-                    });
-                });
-            }
+            YTMUPushPresence(); // instant text+progress
+            YTMUResolveArtworkForTrack(artworkImage, trackKey); // image fills in after
         } else {
-            // SAME TRACK — detect a scrub/seek (elapsed jumped away from expected)
+            // Same track: refresh art if we still don't have it, and handle scrubs
+            if (!gTrackImageKey && artworkImage) {
+                YTMUResolveArtworkForTrack(artworkImage, trackKey);
+            }
             NSTimeInterval expected = now - gTrackStartEpoch;
             if (fabs(elapsed - expected) > 3.0) {
-                NSLog(@"[YTMU] scrub detected, updating timestamps");
+                NSLog(@"[YTMU] scrub detected");
                 gTrackStartEpoch = now - elapsed;
-                YTMUPushPresence(); // keeps existing image, updates progress bar
+                YTMUPushPresence();
             }
-            // else: normal tick, do nothing (no spam)
         }
     });
 }
@@ -374,12 +376,10 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
 - (void)ytmu_scheduleClear {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSInteger myToken = ++gClearToken;
-        // Wait before clearing — a skip briefly reports paused before the next track starts.
-        // If playback resumes within the window, gClearToken advances and this clear is skipped.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (myToken == gClearToken) {
-                NSLog(@"[YTMU] clearing presence (genuinely stopped)");
+                NSLog(@"[YTMU] clearing presence");
                 gPresenceActive = NO;
                 gLastTrackKey = nil;
                 gTrackImageKey = nil;
@@ -390,3 +390,38 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
 }
 
 %end
+
+#pragma mark - App lifecycle: clear presence when app is closed/backgrounded
+
+static void YTMUClearOnExit(void) {
+    gPresenceActive = NO;
+    gLastTrackKey = nil;
+    gTrackImageKey = nil;
+    [[YTMUDiscordGateway shared] clearPresence];
+}
+
+%hook AppDelegate
+
+- (void)applicationDidEnterBackground:(UIApplication *)application {
+    %orig;
+    // Give a short grace period — backgrounding during normal playback shouldn't clear.
+    // Only clear if playback has actually stopped (no active presence refresh) shortly after.
+}
+
+- (void)applicationWillTerminate:(UIApplication *)application {
+    NSLog(@"[YTMU] app terminating, clearing presence");
+    YTMUClearOnExit();
+    %orig;
+}
+
+%end
+
+%ctor {
+    // Also observe termination via notification in case AppDelegate hook name differs
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
+                                                      object:nil queue:nil
+                                                  usingBlock:^(NSNotification *note) {
+        NSLog(@"[YTMU] termination notification, clearing presence");
+        YTMUClearOnExit();
+    }];
+}
