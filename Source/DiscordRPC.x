@@ -19,6 +19,8 @@ static NSString *gTrackImageKey = nil;
 static BOOL gPresenceActive = NO;
 static NSString *gLastTrackKey = nil;
 static NSInteger gClearToken = 0;
+static NSInteger gArtToken = 0;   // debounce token for artwork uploads
+static UIImage *gPendingArtwork = nil;
 
 static void YTMUPushPresence(void);
 
@@ -179,13 +181,12 @@ static void YTMUPushPresence(void);
     } mutableCopy];
 
     if (imageKey.length > 0) {
-        // large_text shows on hover only. Use album if it differs from artist, else the title —
-        // never repeat the artist (which is already the visible `state` line).
-        NSString *hoverText = title ?: @"";
-        if (album.length && ![album isEqualToString:artist]) {
-            hoverText = album;
+        NSMutableDictionary *assets = [@{ @"large_image": imageKey } mutableCopy];
+        // Only add hover text if it's meaningfully different from what's already visible.
+        if (album.length && ![album isEqualToString:artist] && ![album isEqualToString:title]) {
+            assets[@"large_text"] = album;
         }
-        activity[@"assets"] = @{ @"large_image": imageKey, @"large_text": hoverText };
+        activity[@"assets"] = assets;
     }
 
     [self send:@{
@@ -287,15 +288,30 @@ static void YTMURegisterExternalAsset(NSString *imageURL, void (^completion)(NSS
     [task resume];
 }
 
-// Resolve artwork for a given track key; apply only if that track is still current.
-static void YTMUResolveArtworkForTrack(UIImage *artwork, NSString *trackKey) {
+// Debounced artwork resolution: only fires after the user stops skipping for ~800ms,
+// so flying through tracks doesn't flood Nextcloud + Discord's external-assets endpoint.
+static void YTMUScheduleArtwork(UIImage *artwork, NSString *trackKey) {
     if (!artwork) return;
-    YTMUResolveArtwork(artwork, ^(NSString *assetKey) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (assetKey && [gLastTrackKey isEqualToString:trackKey]) {
-                gTrackImageKey = assetKey;
-                YTMUPushPresence(); // re-push now that the image exists (fires even if READY came late)
-            }
+    gPendingArtwork = artwork;
+    NSInteger myToken = ++gArtToken;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        // Bail if another skip happened since, or we've moved off this track
+        if (myToken != gArtToken) return;
+        if (![gLastTrackKey isEqualToString:trackKey]) return;
+
+        UIImage *img = gPendingArtwork;
+        if (!img) return;
+
+        YTMUResolveArtwork(img, ^(NSString *assetKey) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // Only apply if this is still both the newest request AND the current track
+                if (myToken == gArtToken && assetKey && [gLastTrackKey isEqualToString:trackKey]) {
+                    gTrackImageKey = assetKey;
+                    YTMUPushPresence();
+                }
+            });
         });
     });
 }
@@ -355,15 +371,14 @@ static void YTMUResolveArtworkForTrack(UIImage *artwork, NSString *trackKey) {
             gPresenceActive = YES;
 
             NSLog(@"[YTMU] NEW TRACK: %@ — %@", title, artist);
-            YTMUPushPresence(); // instant text+progress
-            YTMUResolveArtworkForTrack(artworkImage, trackKey); // image fills in after
+            YTMUPushPresence();                        // instant text+progress
+            YTMUScheduleArtwork(artworkImage, trackKey); // debounced art
         } else {
-            // Same track: refresh art if we still don't have it, and handle scrubs
             if (!gTrackImageKey && artworkImage) {
-                YTMUResolveArtworkForTrack(artworkImage, trackKey);
+                YTMUScheduleArtwork(artworkImage, trackKey);
             }
             NSTimeInterval expected = now - gTrackStartEpoch;
-            if (fabs(elapsed - expected) > 3.0) {
+            if (fabs(elapsed - expected) > 6.0) {  // wider threshold — avoids jitter spam
                 NSLog(@"[YTMU] scrub detected");
                 gTrackStartEpoch = now - elapsed;
                 YTMUPushPresence();
@@ -383,6 +398,7 @@ static void YTMUResolveArtworkForTrack(UIImage *artwork, NSString *trackKey) {
                 gPresenceActive = NO;
                 gLastTrackKey = nil;
                 gTrackImageKey = nil;
+                gPendingArtwork = nil;
                 [[YTMUDiscordGateway shared] clearPresence];
             }
         });
@@ -391,33 +407,17 @@ static void YTMUResolveArtworkForTrack(UIImage *artwork, NSString *trackKey) {
 
 %end
 
-#pragma mark - App lifecycle: clear presence when app is closed/backgrounded
+#pragma mark - App lifecycle: clear presence on termination
 
 static void YTMUClearOnExit(void) {
     gPresenceActive = NO;
     gLastTrackKey = nil;
     gTrackImageKey = nil;
+    gPendingArtwork = nil;
     [[YTMUDiscordGateway shared] clearPresence];
 }
 
-%hook AppDelegate
-
-- (void)applicationDidEnterBackground:(UIApplication *)application {
-    %orig;
-    // Give a short grace period — backgrounding during normal playback shouldn't clear.
-    // Only clear if playback has actually stopped (no active presence refresh) shortly after.
-}
-
-- (void)applicationWillTerminate:(UIApplication *)application {
-    NSLog(@"[YTMU] app terminating, clearing presence");
-    YTMUClearOnExit();
-    %orig;
-}
-
-%end
-
 %ctor {
-    // Also observe termination via notification in case AppDelegate hook name differs
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
                                                       object:nil queue:nil
                                                   usingBlock:^(NSNotification *note) {
