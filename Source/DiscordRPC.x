@@ -424,7 +424,9 @@ static void YTMUResolveArtwork(UIImage *artwork, NSString *trackKey, void (^comp
             NSLog(@"[YTMU] WebDAV PUT %@ status=%ld", filename, (long)status);
             if (error || status >= 400) { completion(nil); return; }
             // Public folder-share download URL for this single file
-            NSString *publicURL = [NSString stringWithFormat:@"%@/download?path=%%2F&files=%@", kNextcloudPublicURL, filename];
+            NSString *previewBase = [kNextcloudPublicURL stringByReplacingOccurrencesOfString:@"/s/"
+                                                                        withString:@"/apps/files_sharing/publicpreview/"];
+NSString *publicURL = [NSString stringWithFormat:@"%@?file=%%2F%@&x=512&y=512&a=true", previewBase, filename];
             YTMURegisterExternalAsset(publicURL, completion);
         }];
     [uploadTask resume];
